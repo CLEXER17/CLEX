@@ -1,4 +1,5 @@
-import os, asyncio, uuid
+import os, asyncio, uuid, socket, ipaddress
+from urllib.parse import urlparse
 from decimal import Decimal
 from datetime import datetime
 import asyncpg
@@ -13,7 +14,20 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CRYPTO_KEY = os.getenv("CRYPTOMUS_API_KEY")
 MERCHANT_ID = os.getenv("CRYPTOMUS_MERCHANT_ID")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").replace(" ","").split(",") if x}
-GIFT_URLS = {"3":"https://example.com/r/3","5":"https://example.com/r/5","6":"https://example.com/r/6","10":"https://example.com/r/10"}
+ALLOWED_DOMAINS = {d.lower() for d in os.getenv("ALLOWED_DOMAINS","").replace(" ","").split(",") if d}
+
+def check_link(url):
+    # Users send their own gift link; refuse anything that could reach the server's internal network
+    u=urlparse(url)
+    if u.scheme not in ("http","https") or not u.hostname: raise ValueError("Link must start with http:// or https://")
+    host=u.hostname.lower()
+    if ALLOWED_DOMAINS and not any(host==d or host.endswith("."+d) for d in ALLOWED_DOMAINS): raise ValueError("This link's website is not supported")
+    try: addrs={a[4][0] for a in socket.getaddrinfo(host,None)}
+    except socket.gaierror: raise ValueError("Link website not found")
+    for a in addrs:
+        ip=ipaddress.ip_address(a)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified: raise ValueError("Link not allowed")
+    return url
 
 async def get_db():
     return await asyncpg.create_pool(DB_URL, min_size=2, max_size=5)
@@ -56,7 +70,7 @@ class Browser:
         if self.pw: await self.pw.stop()
         self.pw=self.br=self.ctx=None
 
-async def redeem_card(db,uid,card_val,email):
+async def redeem_card(db,uid,card_val,email,link):
     async with db.acquire() as conn:
         user=await conn.fetchrow("SELECT user_id,total_points FROM users WHERE telegram_id=$1",uid)
         if not user: raise ValueError("User not found")
@@ -70,7 +84,8 @@ async def redeem_card(db,uid,card_val,email):
         success=False;err=None
         try:
             page=await browser.launch()
-            await page.goto(GIFT_URLS[str(int(card_val))],wait_until="networkidle",timeout=30000)
+            await page.goto(link,wait_until="networkidle",timeout=30000)
+            await asyncio.to_thread(check_link,page.url)  # also block redirects to internal addresses
             for sel in ['input[type="email"]','input[name="email"]','input[id*="email"]','input[placeholder*="email" i]']:
                 try: await page.wait_for_selector(sel,timeout=3000); await page.fill(sel,email); break
                 except: continue
@@ -82,7 +97,7 @@ async def redeem_card(db,uid,card_val,email):
             success=any(w in txt for w in ["success","confirmed","redeemed","completed","thank you","processed"])
         except Exception as e: err=str(e); await conn.execute("UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",cost,user["user_id"])
         finally: await browser.destroy()
-        rid=await conn.fetchval("INSERT INTO redemptions(user_id,points_spent,paypal_email,status,browser_session_id,error_message)VALUES($1,$2,$3,$4,$5,$6) RETURNING redemption_id",user["user_id"],cost,email,"completed" if success else "failed",browser.sid,err)
+        rid=await conn.fetchval("INSERT INTO redemptions(user_id,points_spent,paypal_email,status,browser_session_id,error_message,gift_url)VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING redemption_id",user["user_id"],cost,email,"completed" if success else "failed",browser.sid,err,link)
         return {"success":success,"rid":rid,"cost":float(cost),"err":err}
 
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
@@ -127,30 +142,40 @@ async def callback(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
             u=await conn.fetchrow("SELECT total_points FROM users WHERE telegram_id=$1",uid)
             pts=u["total_points"] if u else 0
             if val>max_redeem(pts) and not is_admin(uid): await q.edit_message_text(f"❌ Max ${max_redeem(pts)} with {pts} points",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back",callback_data="back")]]));return
-            await q.edit_message_text(f"🎁 Redeeming ${val}\nEnter PayPal email:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="back")]]))
-            ctx.user_data["awaiting_email"]=True
+            await q.edit_message_text(f"🎁 Redeeming ${val}\n🔗 Send your gift card link:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="back")]]))
+            ctx.user_data["step"]="link"
         elif data=="bal":
             u=await conn.fetchrow("SELECT total_points FROM users WHERE telegram_id=$1",uid)
             pts=u["total_points"] if u else 0
             extra="\n👑 Admin: redeems are free" if is_admin(uid) else ""
             await q.edit_message_text(f"📊 Balance: {pts} points\n💵 Max redeem: ${max_redeem(pts)}{extra}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back",callback_data="back")]]))
         elif data=="back":
+            ctx.user_data["step"]=None
             await q.edit_message_text("🤖 Hermes Redeem Bot\n\n💰 Buy Points ($10)\n💎 $1 = 2 Points\n🎁 1pt→$5 max | 2pts→$10 max",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Buy",callback_data="buy"),InlineKeyboardButton("🎁 Redeem",callback_data="redeem")],[InlineKeyboardButton("📊 Balance",callback_data="bal")]]))
 
 async def msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.user_data.get("awaiting_email"): return
+    step=ctx.user_data.get("step")
+    if not step: return
     if await is_banned(update.effective_user.id): return
-    email=update.message.text.strip()
+    text=update.message.text.strip()
+    if step=="link":
+        try: ctx.user_data["link"]=await asyncio.to_thread(check_link,text)
+        except ValueError as e: await update.message.reply_text(f"❌ {e}\n🔗 Send a valid gift card link:");return
+        ctx.user_data["step"]="email"
+        await update.message.reply_text("✅ Link saved\n📧 Now enter your PayPal email:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="back")]]))
+        return
+    email=text
     if "@" not in email or "." not in email.split("@")[1]: await update.message.reply_text("❌ Invalid email");return
-    val=ctx.user_data.get("rv",0)
+    val=ctx.user_data.get("rv",0);link=ctx.user_data.get("link")
+    ctx.user_data["step"]=None
     await update.message.reply_text("⏳ Processing...")
     try:
-        res=await redeem_card(db,update.effective_user.id,val,email)
+        res=await redeem_card(db,update.effective_user.id,val,email,link)
         if res["success"]: await update.message.reply_text(f"✅ ${val} redeemed!\n💎 Spent: {res['cost']} pts\n📧 {email}\n🔒 Browser wiped.")
         else: await update.message.reply_text(f"❌ Failed: {res['err']}\n💎 Points refunded.")
-        await notify_admins(ctx.bot,f"🎁 Redeem #{res['rid']} {'✅ OK' if res['success'] else '❌ FAILED'}\nUser: {update.effective_user.id}\n${val} → {email}\nCost: {res['cost']} pts"+(f"\nError: {res['err']}" if res['err'] else ""))
+        await notify_admins(ctx.bot,f"🎁 Redeem #{res['rid']} {'✅ OK' if res['success'] else '❌ FAILED'}\nUser: {update.effective_user.id}\n${val} → {email}\n🔗 {link}\nCost: {res['cost']} pts"+(f"\nError: {res['err']}" if res['err'] else ""))
     except ValueError as e: await update.message.reply_text(f"❌ {e}")
-    ctx.user_data["awaiting_email"]=False;ctx.user_data["rv"]=None
+    ctx.user_data["rv"]=ctx.user_data["link"]=None
 
 web=FastAPI()
 
@@ -241,8 +266,8 @@ async def pending_cmd(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def redeems_cmd(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     async with db.acquire() as conn:
-        rows=await conn.fetch("SELECT r.redemption_id,r.status,r.points_spent,r.paypal_email,r.error_message,u.telegram_id FROM redemptions r JOIN users u ON u.user_id=r.user_id ORDER BY r.redemption_id DESC LIMIT 10")
-    text="\n\n".join(f"#{r['redemption_id']} {'✅' if r['status']=='completed' else '❌'} {r['telegram_id']}\n{r['points_spent']}pts → {r['paypal_email']}"+(f"\n⚠️ {r['error_message'][:100]}" if r['error_message'] else "") for r in rows)
+        rows=await conn.fetch("SELECT r.redemption_id,r.status,r.points_spent,r.paypal_email,r.error_message,r.gift_url,u.telegram_id FROM redemptions r JOIN users u ON u.user_id=r.user_id ORDER BY r.redemption_id DESC LIMIT 10")
+    text="\n\n".join(f"#{r['redemption_id']} {'✅' if r['status']=='completed' else '❌'} {r['telegram_id']}\n{r['points_spent']}pts → {r['paypal_email']}\n🔗 {r['gift_url'] or '-'}"+(f"\n⚠️ {r['error_message'][:100]}" if r['error_message'] else "") for r in rows)
     await update.message.reply_text(text or "No redeems yet")
 
 @admin_only

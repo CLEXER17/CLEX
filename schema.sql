@@ -4,3 +4,4 @@ CREATE TABLE IF NOT EXISTS redemptions(redemption_id BIGSERIAL PRIMARY KEY,user_
 CREATE INDEX IF NOT EXISTS idx_users_tg ON users(telegram_id);CREATE INDEX IF NOT EXISTS idx_tx_hash ON transactions(crypto_tx_hash);
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
+ALTER TABLE redemptions ADD COLUMN IF NOT EXISTS gift_url TEXT;

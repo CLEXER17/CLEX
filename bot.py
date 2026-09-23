@@ -1,4 +1,4 @@
-import os, asyncio, uuid, socket, ipaddress
+import os, asyncio, uuid, socket, ipaddress, traceback
 from urllib.parse import urlparse
 from decimal import Decimal
 from datetime import datetime
@@ -71,6 +71,12 @@ class Browser:
         self.pw=self.br=self.ctx=None
 
 async def redeem_card(db,uid,card_val,email,link):
+    # Keep a precise stage so any failure tells us exactly where it happened.
+    stage="starting"
+    browser=None
+    page=None
+    browser_sid="unknown"
+
     async with db.acquire() as conn:
         user=await conn.fetchrow("SELECT user_id,total_points FROM users WHERE telegram_id=$1",uid)
         if not user: raise ValueError("User not found")
@@ -87,10 +93,14 @@ async def redeem_card(db,uid,card_val,email,link):
         err=None
 
         try:
+            stage="launching browser"
             page=await browser.launch()
+            browser_sid=getattr(browser,"sid","unknown")
 
             # Load patiently. The site can take time to render its dynamic UI.
+            stage="opening gift-card link"
             await page.goto(link,wait_until="domcontentloaded",timeout=60000)
+            stage="waiting for gift-card page to finish loading"
             try:
                 await page.wait_for_load_state("networkidle",timeout=60000)
             except Exception:
@@ -108,72 +118,110 @@ async def redeem_card(db,uid,card_val,email,link):
                 pass
 
             # --- Make sure India is selected ---
+            stage="checking/selecting country (India)"
             try:
-                # If PayPal is already visible, the country/product page has
-                # already loaded with the current country, so don't disturb it.
                 paypal_option=page.get_by_text("PayPal International",exact=True).last
 
+                # First wait for the page UI to settle. The country control on
+                # this page is a custom clickable element, not necessarily a
+                # button/combobox, so do not depend on those two HTML roles.
+                await page.wait_for_timeout(2000)
+
+                # If PayPal is already visible, country selection is already
+                # complete and there is nothing to click.
                 try:
-                    if await paypal_option.is_visible(timeout=2000):
+                    if await paypal_option.is_visible(timeout=3000):
                         pass
                     else:
-                        raise Exception("PayPal not visible yet")
+                        raise Exception("PayPal not visible")
                 except Exception:
-                    # Open the country selector and choose India.
                     country_opened=False
 
-                    for sel in [
-                        'button:has-text("Select a country")',
-                        '[role="combobox"]',
-                        'button:has-text("India")'
+                    # Try the visible current-country text. This handles the
+                    # custom country selector used by the redemption page.
+                    for country_name in [
+                        "United States",
+                        "United Kingdom",
+                        "Canada",
+                        "Australia",
+                        "Germany",
+                        "France",
+                        "Singapore",
+                        "India"
                     ]:
                         try:
-                            loc=page.locator(sel).first
-                            await loc.wait_for(state="visible",timeout=60000)
-                            await loc.click()
-                            country_opened=True
-                            break
+                            loc=page.get_by_text(country_name,exact=True).last
+                            if await loc.is_visible(timeout=1500):
+                                await loc.click()
+                                country_opened=True
+                                break
                         except Exception:
                             continue
 
+                    # Also try common custom-select structures.
                     if not country_opened:
-                        raise Exception("Country selector did not appear")
+                        for sel in [
+                            '[role="combobox"]',
+                            '[aria-haspopup="listbox"]',
+                            '[aria-haspopup="true"]',
+                            'select',
+                            'button'
+                        ]:
+                            try:
+                                loc=page.locator(sel).filter(
+                                    has_text="United States"
+                                ).first
+                                if await loc.is_visible(timeout=1500):
+                                    await loc.click()
+                                    country_opened=True
+                                    break
+                            except Exception:
+                                continue
 
-                    # Wait for the country list/search UI.
+                    if not country_opened:
+                        # Last resort: click an element whose text contains
+                        # "United States" rather than requiring exact HTML.
+                        loc=page.get_by_text("United States",exact=False).last
+                        await loc.wait_for(state="visible",timeout=30000)
+                        await loc.click()
+                        country_opened=True
+
                     await page.wait_for_timeout(1000)
 
+                    # Search box, if the country picker provides one.
                     search_filled=False
                     for sel in [
                         'input[placeholder*="country" i]',
                         'input[placeholder*="search" i]',
-                        'input[role="combobox"]'
+                        'input[aria-label*="country" i]',
+                        'input[aria-label*="search" i]'
                     ]:
                         try:
                             box=page.locator(sel).last
-                            if await box.is_visible(timeout=3000):
+                            if await box.is_visible(timeout=2000):
                                 await box.fill("India")
                                 search_filled=True
                                 break
                         except Exception:
                             continue
 
-                    # If there is a search field, give the filtered list time
-                    # to render. If there isn't one, India may already be in
-                    # the visible country list.
                     if search_filled:
                         await page.wait_for_timeout(1000)
 
+                    # Select India. Prefer an exact visible option.
                     india=page.get_by_text("India",exact=True).last
                     await india.wait_for(state="visible",timeout=60000)
                     await india.click()
 
-                    # Wait until PayPal becomes available after changing country.
+                    # Wait patiently for the payment methods to refresh.
+                    await page.wait_for_timeout(1500)
                     await paypal_option.wait_for(state="visible",timeout=60000)
 
             except Exception as e:
                 raise Exception(f"Could not select India: {e}")
 
             # --- Select PayPal International ---
+            stage="selecting PayPal International"
             try:
                 paypal=page.get_by_text("PayPal International",exact=True).last
                 await paypal.wait_for(state="visible",timeout=60000)
@@ -186,6 +234,7 @@ async def redeem_card(db,uid,card_val,email,link):
                 raise Exception(f"Could not select PayPal International: {e}")
 
             # --- Wait for BOTH PayPal email fields ---
+            stage="waiting for PayPal email fields"
             try:
                 email_fields=page.locator(
                     'input[type="email"],'
@@ -217,6 +266,7 @@ async def redeem_card(db,uid,card_val,email,link):
                 raise Exception(f"Could not fill both PayPal email fields: {e}")
 
             # --- Wait for and click Transfer $3.00 USD ---
+            stage=f"finding/clicking Transfer ${card_val:.2f} USD"
             try:
                 transfer_button=page.get_by_role(
                     "button",name=f"Transfer ${card_val:.2f} USD"
@@ -269,14 +319,53 @@ async def redeem_card(db,uid,card_val,email,link):
             )
 
         except Exception as e:
-            err=str(e)
+            # Capture the real exception instead of returning only "Failed".
+            # This is intentionally detailed so the next fix can target the
+            # exact Playwright selector/timeout/page state that failed.
+            exc_type=type(e).__name__
+            exc_msg=str(e).strip() or repr(e)
+
+            current_url="unknown"
+            page_title="unknown"
+            try:
+                if page:
+                    current_url=page.url
+                    page_title=await page.title()
+            except Exception:
+                pass
+
+            tb=traceback.format_exc()
+            tb_lines=tb.strip().splitlines()
+            trace_tail=" | ".join(tb_lines[-8:])
+
+            err=(
+                f"{exc_type}: {exc_msg}\n"
+                f"Stage: {stage}\n"
+                f"URL: {current_url}\n"
+                f"Page title: {page_title}\n"
+                f"Trace: {trace_tail}"
+            )
+
+            # Telegram has a message-size limit. Keep the useful beginning
+            # and end of the diagnostic if the traceback is very long.
+            if len(err)>3500:
+                err=err[:2200]+"\n... [trace shortened] ...\n"+err[-1200:]
+
             await conn.execute(
                 "UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",
                 cost,user["user_id"]
             )
 
         finally:
-            await browser.destroy()
+            try:
+                if browser:
+                    await browser.destroy()
+            except Exception as destroy_error:
+                # Browser cleanup errors should also be visible to us, but
+                # should not hide the original redemption error.
+                if not err:
+                    err=f"{type(destroy_error).__name__}: {destroy_error}\nStage: browser cleanup"
+
 
         rid=await conn.fetchval(
             "INSERT INTO redemptions"
@@ -286,7 +375,7 @@ async def redeem_card(db,uid,card_val,email,link):
             cost,
             email,
             "completed" if success else "failed",
-            browser.sid,
+            browser_sid,
             err,
             link
         )

@@ -79,26 +79,224 @@ async def redeem_card(db,uid,card_val,email,link):
         else:
             if user["total_points"]<cost: raise ValueError(f"Need {cost} pts, have {user['total_points']}")
             if card_val>max_redeem(user["total_points"]): raise ValueError(f"Max ${max_redeem(user['total_points'])} with your points")
+
         await conn.execute("UPDATE users SET total_points=total_points-$1 WHERE user_id=$2",cost,user["user_id"])
+
         browser=Browser()
-        success=False;err=None
+        success=False
+        err=None
+
         try:
             page=await browser.launch()
-            await page.goto(link,wait_until="networkidle",timeout=30000)
-            await asyncio.to_thread(check_link,page.url)  # also block redirects to internal addresses
-            for sel in ['input[type="email"]','input[name="email"]','input[id*="email"]','input[placeholder*="email" i]']:
-                try: await page.wait_for_selector(sel,timeout=3000); await page.fill(sel,email); break
-                except: continue
-            for sel in ['button[type="submit"]','input[type="submit"]','button:has-text("Redeem")','button:has-text("Submit")']:
-                try: await page.click(sel,timeout=3000); break
-                except: continue
-            await asyncio.sleep(3)
+
+            # Load patiently. The site can take time to render its dynamic UI.
+            await page.goto(link,wait_until="domcontentloaded",timeout=60000)
+            try:
+                await page.wait_for_load_state("networkidle",timeout=60000)
+            except Exception:
+                # Some pages keep network connections open; DOM is already loaded.
+                pass
+
+            await asyncio.to_thread(check_link,page.url)
+
+            # Give the application a chance to finish rendering.
+            try:
+                await page.get_by_text("Select a product",exact=True).wait_for(
+                    state="visible",timeout=60000
+                )
+            except Exception:
+                pass
+
+            # --- Make sure India is selected ---
+            try:
+                # If PayPal is already visible, the country/product page has
+                # already loaded with the current country, so don't disturb it.
+                paypal_option=page.get_by_text("PayPal International",exact=True).last
+
+                try:
+                    if await paypal_option.is_visible(timeout=2000):
+                        pass
+                    else:
+                        raise Exception("PayPal not visible yet")
+                except Exception:
+                    # Open the country selector and choose India.
+                    country_opened=False
+
+                    for sel in [
+                        'button:has-text("Select a country")',
+                        '[role="combobox"]',
+                        'button:has-text("India")'
+                    ]:
+                        try:
+                            loc=page.locator(sel).first
+                            await loc.wait_for(state="visible",timeout=60000)
+                            await loc.click()
+                            country_opened=True
+                            break
+                        except Exception:
+                            continue
+
+                    if not country_opened:
+                        raise Exception("Country selector did not appear")
+
+                    # Wait for the country list/search UI.
+                    await page.wait_for_timeout(1000)
+
+                    search_filled=False
+                    for sel in [
+                        'input[placeholder*="country" i]',
+                        'input[placeholder*="search" i]',
+                        'input[role="combobox"]'
+                    ]:
+                        try:
+                            box=page.locator(sel).last
+                            if await box.is_visible(timeout=3000):
+                                await box.fill("India")
+                                search_filled=True
+                                break
+                        except Exception:
+                            continue
+
+                    # If there is a search field, give the filtered list time
+                    # to render. If there isn't one, India may already be in
+                    # the visible country list.
+                    if search_filled:
+                        await page.wait_for_timeout(1000)
+
+                    india=page.get_by_text("India",exact=True).last
+                    await india.wait_for(state="visible",timeout=60000)
+                    await india.click()
+
+                    # Wait until PayPal becomes available after changing country.
+                    await paypal_option.wait_for(state="visible",timeout=60000)
+
+            except Exception as e:
+                raise Exception(f"Could not select India: {e}")
+
+            # --- Select PayPal International ---
+            try:
+                paypal=page.get_by_text("PayPal International",exact=True).last
+                await paypal.wait_for(state="visible",timeout=60000)
+                await paypal.click()
+
+                # Wait for the PayPal transfer form to fully render.
+                await page.wait_for_timeout(1000)
+
+            except Exception as e:
+                raise Exception(f"Could not select PayPal International: {e}")
+
+            # --- Wait for BOTH PayPal email fields ---
+            try:
+                email_fields=page.locator(
+                    'input[type="email"],'
+                    'input[name*="email" i],'
+                    'input[id*="email" i]'
+                )
+
+                await email_fields.first.wait_for(
+                    state="visible",timeout=60000
+                )
+
+                # Do not assume the second field appears immediately.
+                for _ in range(60):
+                    if await email_fields.count() >= 2:
+                        break
+                    await page.wait_for_timeout(1000)
+
+                if await email_fields.count() < 2:
+                    raise Exception("Both PayPal email fields did not load")
+
+                # First field may contain a pre-filled email.
+                # fill() clears the existing value before entering the user's email.
+                await email_fields.nth(0).fill(email)
+
+                # Confirmation email field.
+                await email_fields.nth(1).fill(email)
+
+            except Exception as e:
+                raise Exception(f"Could not fill both PayPal email fields: {e}")
+
+            # --- Wait for and click Transfer $3.00 USD ---
+            try:
+                transfer_button=page.get_by_role(
+                    "button",name=f"Transfer ${card_val:.2f} USD"
+                )
+                await transfer_button.wait_for(
+                    state="visible",timeout=60000
+                )
+                await transfer_button.click()
+
+            except Exception:
+                # Fallback for slightly different button rendering/text.
+                clicked=False
+
+                for sel in [
+                    'button:has-text("Transfer $")',
+                    'button:has-text("Transfer")',
+                    'button[type="submit"]'
+                ]:
+                    try:
+                        button=page.locator(sel).first
+                        await button.wait_for(state="visible",timeout=10000)
+                        await button.click()
+                        clicked=True
+                        break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    raise Exception("Transfer button not found")
+
+            # Give the result page/time to settle before checking it.
+            try:
+                await page.wait_for_load_state("networkidle",timeout=30000)
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(3000)
+
             txt=(await page.content()).lower()
-            success=any(w in txt for w in ["success","confirmed","redeemed","completed","thank you","processed"])
-        except Exception as e: err=str(e); await conn.execute("UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",cost,user["user_id"])
-        finally: await browser.destroy()
-        rid=await conn.fetchval("INSERT INTO redemptions(user_id,points_spent,paypal_email,status,browser_session_id,error_message,gift_url)VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING redemption_id",user["user_id"],cost,email,"completed" if success else "failed",browser.sid,err,link)
-        return {"success":success,"rid":rid,"cost":float(cost),"err":err}
+            success=any(
+                w in txt
+                for w in [
+                    "success",
+                    "confirmed",
+                    "redeemed",
+                    "completed",
+                    "thank you",
+                    "processed"
+                ]
+            )
+
+        except Exception as e:
+            err=str(e)
+            await conn.execute(
+                "UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",
+                cost,user["user_id"]
+            )
+
+        finally:
+            await browser.destroy()
+
+        rid=await conn.fetchval(
+            "INSERT INTO redemptions"
+            "(user_id,points_spent,paypal_email,status,browser_session_id,error_message,gift_url)"
+            "VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING redemption_id",
+            user["user_id"],
+            cost,
+            email,
+            "completed" if success else "failed",
+            browser.sid,
+            err,
+            link
+        )
+
+        return {
+            "success":success,
+            "rid":rid,
+            "cost":float(cost),
+            "err":err
+        }
 
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     uid=update.effective_user.id

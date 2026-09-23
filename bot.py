@@ -311,7 +311,10 @@ class Browser:
     async def launch(self):
         self.pw = await async_playwright().start()
         self.br = await self.pw.chromium.launch(headless=True,args=["--no-sandbox","--disable-setuid-sandbox"])
-        self.ctx = await self.br.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",viewport={"width":1920,"height":1080},extra_http_headers={"DNT":"1","Sec-GPC":"1"})
+        # Complete Chrome user-agent (the old truncated one triggered "unsupported browser").
+        ver=self.br.version or "128.0.0.0"
+        ua=f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36"
+        self.ctx = await self.br.new_context(user_agent=ua,viewport={"width":1920,"height":1080},extra_http_headers={"DNT":"1","Sec-GPC":"1"})
         await self.ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});window.chrome={runtime:{}};")
         return await self.ctx.new_page()
     async def destroy(self):
@@ -362,10 +365,34 @@ async def redeem_card(db,uid,card_val,email,link):
 
             await asyncio.to_thread(check_link,page.url)
 
+            # --- Landing screen: dismiss banner, click "Redeem $X.XX USD" ---
+            stage="opening reward (clicking Redeem)"
+            select_product=page.get_by_text("Select a product",exact=True)
             try:
-                await page.get_by_text("Select a product",exact=True).wait_for(state="visible",timeout=30000)
+                banner=page.get_by_text(re.compile(r"unsupported browser",re.I))
+                if await banner.count() and await banner.first.is_visible():
+                    await click_first_visible([page.get_by_role("button",name=re.compile(r"^\s*close\s*$",re.I))])
+                    await page.wait_for_timeout(500)
             except Exception:
                 pass
+
+            for _ in range(3):
+                if await select_product.count() and await select_product.first.is_visible():
+                    break
+                redeem_btn=page.get_by_role("button",name=re.compile(r"^\s*Redeem\b",re.I))
+                try:
+                    await redeem_btn.first.wait_for(state="visible",timeout=20000)
+                    await redeem_btn.first.click()
+                except Exception:
+                    pass
+                try:
+                    await select_product.first.wait_for(state="visible",timeout=30000)
+                    break
+                except Exception:
+                    continue
+
+            if not (await select_product.count() and await select_product.first.is_visible()):
+                raise Exception(f"'Select a product' screen did not open after clicking Redeem. Visible controls: {await debug_controls(page)}")
 
             # --- Make sure India is selected ---
             stage="checking/selecting country (India)"

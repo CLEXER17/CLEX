@@ -121,57 +121,65 @@ async def redeem_card(db,uid,card_val,email,link):
             stage="checking/selecting country (India)"
             try:
                 paypal_option=page.get_by_text("PayPal International",exact=True).last
+                await page.wait_for_timeout(1500)
 
-                # First wait for the page UI to settle. The country control on
-                # this page is a custom clickable element, not necessarily a
-                # button/combobox, so do not depend on those two HTML roles.
-                await page.wait_for_timeout(2000)
+                # The Tremendous page can already have India selected.
+                # In that case, DO NOT open the country dropdown at all.
+                current_country="unknown"
+                for country_name in [
+                    "India", "United States", "United Kingdom", "Canada",
+                    "Australia", "Germany", "France", "Singapore"
+                ]:
+                    try:
+                        matches=page.get_by_text(country_name,exact=True)
+                        visible_count=await matches.count()
+                        for i in range(visible_count):
+                            loc=matches.nth(i)
+                            if await loc.is_visible(timeout=1000):
+                                current_country=country_name
+                                break
+                        if current_country != "unknown":
+                            break
+                    except Exception:
+                        continue
 
-                # If PayPal is already visible, country selection is already
-                # complete and there is nothing to click.
-                try:
-                    if await paypal_option.is_visible(timeout=3000):
-                        pass
-                    else:
-                        raise Exception("PayPal not visible")
-                except Exception:
+                # Tell the admin/user what country was already showing.
+                if current_country != "unknown":
+                    country_status=f"Country shown before selection: {current_country}"
+                else:
+                    country_status="Country shown before selection: could not be detected"
+
+                if current_country == "India":
+                    # Screenshot/page state can already be India. Nothing else
+                    # is required; continue directly to PayPal.
+                    pass
+                else:
                     country_opened=False
 
-                    # Try the visible current-country text. This handles the
-                    # custom country selector used by the redemption page.
-                    for country_name in [
-                        "United States",
-                        "United Kingdom",
-                        "Canada",
-                        "Australia",
-                        "Germany",
-                        "France",
-                        "Singapore",
-                        "India"
-                    ]:
+                    # Click the currently displayed country to open the picker.
+                    if current_country != "unknown":
                         try:
-                            loc=page.get_by_text(country_name,exact=True).last
-                            if await loc.is_visible(timeout=1500):
+                            loc=page.get_by_text(current_country,exact=True).last
+                            if await loc.is_visible(timeout=3000):
                                 await loc.click()
                                 country_opened=True
-                                break
                         except Exception:
-                            continue
+                            pass
 
-                    # Also try common custom-select structures.
+                    # Fallback: locate a custom country/region selector without
+                    # assuming that "United States" is present.
                     if not country_opened:
                         for sel in [
                             '[role="combobox"]',
                             '[aria-haspopup="listbox"]',
                             '[aria-haspopup="true"]',
                             'select',
-                            'button'
+                            '[class*="country" i]',
+                            '[class*="region" i]'
                         ]:
                             try:
-                                loc=page.locator(sel).filter(
-                                    has_text="United States"
-                                ).first
-                                if await loc.is_visible(timeout=1500):
+                                loc=page.locator(sel).last
+                                if await loc.is_visible(timeout=2000):
                                     await loc.click()
                                     country_opened=True
                                     break
@@ -179,43 +187,65 @@ async def redeem_card(db,uid,card_val,email,link):
                                 continue
 
                     if not country_opened:
-                        # Last resort: click an element whose text contains
-                        # "United States" rather than requiring exact HTML.
-                        loc=page.get_by_text("United States",exact=False).last
-                        await loc.wait_for(state="visible",timeout=30000)
-                        await loc.click()
-                        country_opened=True
+                        raise Exception(
+                            f"Could not open country selector. {country_status}"
+                        )
 
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(700)
 
-                    # Search box, if the country picker provides one.
+                    # The picker shown in the screenshot has a search field.
+                    # Type India, then click the actual India option.
                     search_filled=False
                     for sel in [
                         'input[placeholder*="country" i]',
                         'input[placeholder*="search" i]',
                         'input[aria-label*="country" i]',
-                        'input[aria-label*="search" i]'
+                        'input[aria-label*="search" i]',
+                        'input[type="text"]'
                     ]:
                         try:
-                            box=page.locator(sel).last
-                            if await box.is_visible(timeout=2000):
-                                await box.fill("India")
-                                search_filled=True
+                            boxes=page.locator(sel)
+                            for i in range(await boxes.count()):
+                                box=boxes.nth(i)
+                                if await box.is_visible(timeout=1000):
+                                    await box.fill("India")
+                                    search_filled=True
+                                    break
+                            if search_filled:
                                 break
                         except Exception:
                             continue
 
-                    if search_filled:
-                        await page.wait_for_timeout(1000)
+                    if not search_filled:
+                        raise Exception(
+                            f"Country selector opened but its search field could not be found. {country_status}"
+                        )
 
-                    # Select India. Prefer an exact visible option.
-                    india=page.get_by_text("India",exact=True).last
-                    await india.wait_for(state="visible",timeout=60000)
-                    await india.click()
+                    await page.wait_for_timeout(700)
 
-                    # Wait patiently for the payment methods to refresh.
-                    await page.wait_for_timeout(1500)
-                    await paypal_option.wait_for(state="visible",timeout=60000)
+                    # Select the exact India result. Do not click the current
+                    # country field again; select the dropdown result instead.
+                    india_selected=False
+                    india_matches=page.get_by_text("India",exact=True)
+                    for i in range(await india_matches.count()):
+                        loc=india_matches.nth(i)
+                        try:
+                            if await loc.is_visible(timeout=1500):
+                                await loc.click()
+                                india_selected=True
+                                break
+                        except Exception:
+                            continue
+
+                    if not india_selected:
+                        raise Exception(
+                            f"Country search completed but the India option could not be selected. {country_status}"
+                        )
+
+                    await page.wait_for_timeout(500)
+
+                # Make the detected country status available in logs/errors.
+                stage=f"checking/selecting country (India) | {country_status}"
 
             except Exception as e:
                 raise Exception(f"Could not select India: {e}")

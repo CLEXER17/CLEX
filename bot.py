@@ -126,22 +126,55 @@ async def redeem_card(db,uid,card_val,email,link):
                 # The Tremendous page can already have India selected.
                 # In that case, DO NOT open the country dropdown at all.
                 current_country="unknown"
-                for country_name in [
-                    "India", "United States", "United Kingdom", "Canada",
-                    "Australia", "Germany", "France", "Singapore"
-                ]:
-                    try:
-                        matches=page.get_by_text(country_name,exact=True)
-                        visible_count=await matches.count()
-                        for i in range(visible_count):
-                            loc=matches.nth(i)
-                            if await loc.is_visible(timeout=1000):
-                                current_country=country_name
+
+                # The country shown in the Tremendous field is an INPUT VALUE
+                # (for example, "india"), not necessarily visible text.
+                # Check input values first so an already-selected India is
+                # detected without opening the dropdown.
+                try:
+                    inputs=page.locator("input")
+                    for i in range(await inputs.count()):
+                        loc=inputs.nth(i)
+                        try:
+                            if not await loc.is_visible(timeout=1000):
+                                continue
+                            value=(await loc.input_value()).strip()
+                            aria=(await loc.get_attribute("aria-label") or "").strip()
+                            placeholder=(await loc.get_attribute("placeholder") or "").strip()
+                            combined=f"{value} {aria} {placeholder}".lower()
+                            if value and any(x in combined for x in [
+                                "india", "united states", "united kingdom",
+                                "canada", "australia", "germany", "france",
+                                "singapore"
+                            ]):
+                                if "india" in value.lower():
+                                    current_country="India"
+                                else:
+                                    current_country=value
                                 break
-                        if current_country != "unknown":
-                            break
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # Also check visible text / accessible labels as a fallback.
+                if current_country == "unknown":
+                    for country_name in [
+                        "India", "United States", "United Kingdom", "Canada",
+                        "Australia", "Germany", "France", "Singapore"
+                    ]:
+                        try:
+                            matches=page.get_by_text(country_name,exact=True)
+                            visible_count=await matches.count()
+                            for i in range(visible_count):
+                                loc=matches.nth(i)
+                                if await loc.is_visible(timeout=1000):
+                                    current_country=country_name
+                                    break
+                            if current_country != "unknown":
+                                break
+                        except Exception:
+                            continue
 
                 # Tell the admin/user what country was already showing.
                 if current_country != "unknown":

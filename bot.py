@@ -1,4 +1,4 @@
-import os, asyncio, uuid, socket, ipaddress, re, traceback
+import os, io, re, asyncio, uuid, socket, ipaddress, traceback
 from urllib.parse import urlparse
 from decimal import Decimal
 from datetime import datetime
@@ -44,12 +44,265 @@ async def notify_admins(bot,text):
         try: await bot.send_message(aid,text)
         except Exception: pass
 
+async def notify_admins_photo(bot,data,caption):
+    for aid in ADMIN_IDS:
+        try: await bot.send_photo(aid,io.BytesIO(data),caption=caption[:1000])
+        except Exception: pass
+
 async def is_banned(uid):
     async with db.acquire() as conn:
         return bool(await conn.fetchval("SELECT banned FROM users WHERE telegram_id=$1",uid))
 
 def max_redeem(pts):
     return Decimal("0") if pts <= 0 else Decimal("5") if pts < 2 else Decimal("10")
+
+# ---------------- Country selection helpers ----------------
+
+COUNTRIES=["india","united states","united kingdom","canada","australia","germany","france","singapore",
+           "netherlands","spain","italy","brazil","mexico","philippines","pakistan","bangladesh","nigeria"]
+
+PAYPAL_RE=re.compile(r"PayPal\s+International",re.I)
+
+# Finds the element that currently shows the selected country (button text, input value,
+# <select> label, flag alt text, aria-label) and marks its clickable ancestor.
+DETECT_COUNTRY_JS=r"""
+(names) => {
+  document.querySelectorAll('[data-hermes-country]').forEach(e=>e.removeAttribute('data-hermes-country'));
+  const vis=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+  const clean=t=>(t||'').replace(/[^\p{L}\s]/gu,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  const INTER='button,select,input,a,label,[role=combobox],[role=button],[role=listbox],[aria-haspopup],[aria-expanded],[tabindex]';
+  const cands=[];
+  for (const e of document.querySelectorAll('body *')) {
+    if (!vis(e)) continue;
+    const tag=e.tagName;
+    let t='';
+    if (tag==='SELECT') t=e.selectedOptions&&e.selectedOptions[0]?e.selectedOptions[0].textContent:'';
+    else if (tag==='INPUT') t=e.value||'';
+    else if (tag==='IMG') t=e.alt||'';
+    else { const it=e.innerText||''; if (it.length<=40) t=it; }
+    const labels=[t,e.getAttribute('aria-label')||'',e.getAttribute('title')||''];
+    for (const raw of labels) {
+      const c=clean(raw);
+      if (!c) continue;
+      const name=names.find(n=>c===n||(c.includes(n)&&c.length<=n.length+20));
+      if (!name) continue;
+      const target=(tag==='SELECT'||tag==='INPUT')?e:(e.closest(INTER)||e);
+      const hint=clean((target.getAttribute('class')||'')+' '+(target.getAttribute('aria-label')||'')+' '+(target.getAttribute('name')||'')+' '+(target.id||''));
+      let score=0;
+      if (target!==e||['SELECT','INPUT','BUTTON'].includes(tag)) score-=10;
+      if (/country|region|locale/.test(hint)) score-=20;
+      score+=c.length;
+      cands.push({target,name,score,tag:target.tagName});
+      break;
+    }
+  }
+  if (!cands.length) return null;
+  cands.sort((a,b)=>a.score-b.score);
+  cands[0].target.setAttribute('data-hermes-country','1');
+  return {name:cands[0].name,tag:cands[0].tag};
+}
+"""
+
+# Finds the "India" option inside the opened picker (not the trigger itself).
+FIND_INDIA_OPTION_JS=r"""
+() => {
+  document.querySelectorAll('[data-hermes-india]').forEach(e=>e.removeAttribute('data-hermes-india'));
+  const vis=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+  const clean=t=>(t||'').replace(/[^\p{L}\s]/gu,' ').replace(/\s+/g,' ').trim().toLowerCase();
+  const OPT='[role=option],li,[role=menuitem],[role=menuitemradio]';
+  const trig=document.querySelector('[data-hermes-country]');
+  const cands=[];
+  for (const e of document.querySelectorAll('body *')) {
+    if (!vis(e)||e.tagName==='INPUT'||e.tagName==='SELECT') continue;
+    // Skip the trigger itself and its ancestors, but NOT its descendants:
+    // the dropdown menu is often rendered inside the same control.
+    if (trig&&e.contains(trig)) continue;
+    if (/singlevalue|single-value|placeholder/i.test(e.className||'')) continue;
+    const c=clean(e.innerText);
+    if (c==='india') cands.push(e);
+  }
+  if (!cands.length) return false;
+  const score=e=>(e.closest(OPT)?0:1);
+  cands.sort((a,b)=>score(a)-score(b)||(a.innerText.length-b.innerText.length));
+  const t=cands[0].closest(OPT)||cands[0];
+  t.setAttribute('data-hermes-india','1');
+  return true;
+}
+"""
+
+# Diagnostic: what controls are visible on the page right now.
+DEBUG_CONTROLS_JS=r"""
+() => {
+  const vis=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+  const out=[];
+  for (const e of document.querySelectorAll('button,select,input,[role=combobox],[role=button],[aria-haspopup]')) {
+    if (!vis(e)) continue;
+    let t=(e.tagName==='INPUT'?(e.value||e.placeholder||''):(e.innerText||e.getAttribute('aria-label')||'')).replace(/\s+/g,' ').trim().slice(0,40);
+    out.push(e.tagName.toLowerCase()+(e.getAttribute('role')?'['+e.getAttribute('role')+']':'')+':'+(t||'-'));
+    if (out.length>=20) break;
+  }
+  return out.join(' | ');
+}
+"""
+
+async def paypal_visible(page):
+    try:
+        loc=page.get_by_text(PAYPAL_RE)
+        for i in range(await loc.count()):
+            if await loc.nth(i).is_visible(): return True
+    except Exception: pass
+    return False
+
+async def debug_controls(page):
+    try: return await page.evaluate(DEBUG_CONTROLS_JS)
+    except Exception as e: return f"(debug failed: {e})"
+
+async def click_first_visible(locators):
+    for loc in locators:
+        try:
+            for i in range(min(await loc.count(),5)):
+                l=loc.nth(i)
+                if await l.is_visible():
+                    await l.click(timeout=5000)
+                    return True
+        except Exception:
+            continue
+    return False
+
+async def ensure_india(page):
+    """Returns a status string. Raises Exception with diagnostics on failure."""
+    # 1) Wait up to 30s for either a country control or PayPal International to render.
+    detected=None
+    for _ in range(30):
+        try: detected=await page.evaluate(DETECT_COUNTRY_JS,COUNTRIES)
+        except Exception: detected=None
+        if detected or await paypal_visible(page): break
+        await page.wait_for_timeout(1000)
+
+    shown=detected["name"].title() if detected else "not detected"
+    status=f"Country shown before selection: {shown}"
+
+    # 2) Already India -> nothing to do.
+    if detected and detected["name"]=="india":
+        return status+" (already India)"
+
+    # 3) Country unknown but PayPal International already available -> skip the picker.
+    if not detected and await paypal_visible(page):
+        return status+" (PayPal International already available, picker skipped)"
+
+    # 4) Open the picker.
+    opened=False
+    if detected:
+        trig=page.locator("[data-hermes-country]").first
+        if detected["tag"]=="SELECT":
+            try:
+                await trig.select_option(label="India")
+                await page.wait_for_timeout(1500)
+                return status+" -> India (native select)"
+            except Exception:
+                pass
+        try:
+            await trig.click(timeout=5000)
+            opened=True
+        except Exception:
+            pass
+
+    if not opened:
+        opened=await click_first_visible([
+            page.get_by_label(re.compile(r"country|region",re.I)),
+            page.get_by_role("combobox"),
+            page.get_by_role("button",name=re.compile(r"country|region",re.I)),
+            page.get_by_text(re.compile(r"^\s*change( country| region)?\s*$",re.I)),
+            page.locator('[aria-haspopup="listbox"]'),
+            page.locator('[class*="country" i]'),
+            page.locator('[class*="region" i]'),
+            page.locator('[data-testid*="country" i]'),
+        ])
+
+    if not opened:
+        if await paypal_visible(page):
+            return status+" (no picker found, PayPal International visible)"
+        raise Exception(f"Could not open country selector. {status}. Visible controls: {await debug_controls(page)}")
+
+    await page.wait_for_timeout(800)
+
+    # Native <select> revealed after click?
+    try:
+        sel=page.locator("select")
+        for i in range(await sel.count()):
+            s=sel.nth(i)
+            if await s.is_visible():
+                try:
+                    await s.select_option(label="India")
+                    await page.wait_for_timeout(1500)
+                    return status+" -> India (select)"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 5) Type into the picker's search box (or directly via keyboard if none).
+    typed=False
+    for loc in [
+        page.locator('[role="dialog"] input, [role="listbox"] input, [role="combobox"] input, input[role="combobox"]'),
+        page.locator('input[placeholder*="country" i], input[placeholder*="search" i], input[aria-label*="country" i], input[aria-label*="search" i]'),
+        page.locator('[data-hermes-country] input, input[data-hermes-country]'),
+        page.locator('input[type="text"], input[type="search"], input:not([type])'),
+    ]:
+        try:
+            for i in range(await loc.count()):
+                box=loc.nth(i)
+                if await box.is_visible() and await box.is_editable():
+                    await box.fill("")
+                    await box.type("India",delay=60)
+                    typed=True
+                    break
+        except Exception:
+            continue
+        if typed: break
+    if not typed:
+        try:
+            await page.keyboard.type("India",delay=60)
+            typed=True
+        except Exception:
+            pass
+
+    await page.wait_for_timeout(1000)
+
+    # 6) Click the exact "India" option. Never press Enter: typing "india" lists
+    #    "British Indian Ocean Territory" FIRST, so Enter would pick the wrong country.
+    picked=False
+    for _ in range(6):
+        picked=await click_first_visible([
+            page.get_by_role("option",name=re.compile(r"^\W*India\W*$",re.I)),
+            page.get_by_role("menuitem",name=re.compile(r"^\W*India\W*$",re.I)),
+        ])
+        if picked: break
+        try:
+            if await page.evaluate(FIND_INDIA_OPTION_JS):
+                await page.locator("[data-hermes-india]").first.click(timeout=5000)
+                picked=True
+                break
+        except Exception:
+            pass
+        await page.wait_for_timeout(800)
+
+    if not picked:
+        raise Exception(f"India option not found in the country list. {status}. Visible controls: {await debug_controls(page)}")
+
+    # 7) Verify: India shown AND PayPal International available (that's what we need).
+    for _ in range(15):
+        if await paypal_visible(page): break
+        await page.wait_for_timeout(1000)
+    try: after=await page.evaluate(DETECT_COUNTRY_JS,COUNTRIES)
+    except Exception: after=None
+    now=after["name"] if after else "unknown"
+    if await paypal_visible(page):
+        return status+f" -> {now.title()}"
+
+    raise Exception(f"Country changed but PayPal International did not appear. {status}. Now shown: {now}. Visible controls: {await debug_controls(page)}")
+
+# ---------------- Browser ----------------
 
 class Browser:
     def __init__(self):
@@ -64,18 +317,20 @@ class Browser:
     async def destroy(self):
         if self.ctx:
             for p in self.ctx.pages:
-                await p.evaluate("localStorage.clear();sessionStorage.clear();document.cookie.split(';').forEach(c=>{document.cookie=c.replace(/^ +/,'').replace(/=.*/,'=;expires='+new Date().toUTCString()+';path=/')})")
+                try: await p.evaluate("localStorage.clear();sessionStorage.clear();document.cookie.split(';').forEach(c=>{document.cookie=c.replace(/^ +/,'').replace(/=.*/,'=;expires='+new Date().toUTCString()+';path=/')})")
+                except Exception: pass
             await self.ctx.clear_cookies()
         if self.br: await self.br.close()
         if self.pw: await self.pw.stop()
         self.pw=self.br=self.ctx=None
 
 async def redeem_card(db,uid,card_val,email,link):
-    # Keep a precise stage so any failure tells us exactly where it happened.
     stage="starting"
     browser=None
     page=None
     browser_sid="unknown"
+    shot=None
+    country_status=""
 
     async with db.acquire() as conn:
         user=await conn.fetchrow("SELECT user_id,total_points FROM users WHERE telegram_id=$1",uid)
@@ -97,206 +352,38 @@ async def redeem_card(db,uid,card_val,email,link):
             page=await browser.launch()
             browser_sid=getattr(browser,"sid","unknown")
 
-            # Load patiently. The site can take time to render its dynamic UI.
             stage="opening gift-card link"
             await page.goto(link,wait_until="domcontentloaded",timeout=60000)
             stage="waiting for gift-card page to finish loading"
             try:
                 await page.wait_for_load_state("networkidle",timeout=60000)
             except Exception:
-                # Some pages keep network connections open; DOM is already loaded.
                 pass
 
             await asyncio.to_thread(check_link,page.url)
 
-            # Give the application a chance to finish rendering.
             try:
-                await page.get_by_text("Select a product",exact=True).wait_for(
-                    state="visible",timeout=60000
-                )
+                await page.get_by_text("Select a product",exact=True).wait_for(state="visible",timeout=30000)
             except Exception:
                 pass
 
             # --- Make sure India is selected ---
             stage="checking/selecting country (India)"
             try:
-                await page.wait_for_timeout(1500)
-
-                # Tremendous can render the selected country as lowercase text
-                # (for example: "india") inside a custom field. Do NOT rely on
-                # exact-case get_by_text("India") and do NOT assume a button.
-                current_country="unknown"
-
-                # 1) First inspect visible input values. This handles a real
-                # input whose value is "india".
-                try:
-                    inputs=page.locator("input")
-                    for i in range(await inputs.count()):
-                        loc=inputs.nth(i)
-                        try:
-                            if not await loc.is_visible(timeout=500):
-                                continue
-                            value=(await loc.input_value()).strip()
-                            aria=(await loc.get_attribute("aria-label") or "").strip()
-                            placeholder=(await loc.get_attribute("placeholder") or "").strip()
-                            combined=f"{value} {aria} {placeholder}".strip()
-                            if not value:
-                                continue
-                            low=value.lower()
-                            if low == "india":
-                                current_country="India"
-                                break
-                            # Identify common country values if the field is
-                            # already populated with another country.
-                            common=[
-                                "united states","united kingdom","canada","australia",
-                                "germany","france","singapore","india","japan",
-                                "south korea","united arab emirates"
-                            ]
-                            if any(c in low for c in common) and not "email" in combined.lower():
-                                current_country=value
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-
-                # 2) Then inspect visible text case-insensitively. The actual
-                # page uses lowercase "india", so exact-case matching is wrong.
-                if current_country == "unknown":
-                    try:
-                        body_text=await page.locator("body").inner_text(timeout=5000)
-                        lines=[x.strip() for x in body_text.splitlines() if x.strip()]
-                        known_countries=[
-                            "India","United States","United Kingdom","Canada",
-                            "Australia","Germany","France","Singapore","Japan",
-                            "South Korea","United Arab Emirates"
-                        ]
-                        for name in known_countries:
-                            if any(line.lower()==name.lower() for line in lines):
-                                current_country=name
-                                break
-                    except Exception:
-                        pass
-
-                if current_country != "unknown":
-                    country_status=f"Country shown before selection: {current_country}"
-                else:
-                    country_status="Country shown before selection: could not be detected"
-
-                # If India is already displayed, this is the normal path shown
-                # in the user's screenshot: do nothing and continue.
-                if current_country == "India":
-                    stage=f"checking/selecting country (India) | {country_status} | already selected"
-                else:
-                    country_opened=False
-
-                    # If another country is displayed as text, click it using
-                    # case-insensitive matching.
-                    if current_country != "unknown":
-                        try:
-                            loc=page.get_by_text(re.compile(r"^"+re.escape(current_country)+r"$", re.I)).last
-                            if await loc.is_visible(timeout=3000):
-                                await loc.click()
-                                country_opened=True
-                        except Exception:
-                            pass
-
-                    # Fallback for the custom selector used by Tremendous.
-                    if not country_opened:
-                        for sel in [
-                            '[role="combobox"]',
-                            '[aria-haspopup="listbox"]',
-                            '[aria-haspopup="true"]',
-                            'button',
-                            'select',
-                            '[class*="country" i]',
-                            '[class*="region" i]'
-                        ]:
-                            try:
-                                locators=page.locator(sel)
-                                for i in range(await locators.count()):
-                                    loc=locators.nth(i)
-                                    if await loc.is_visible(timeout=500):
-                                        await loc.click()
-                                        country_opened=True
-                                        break
-                                if country_opened:
-                                    break
-                            except Exception:
-                                continue
-
-                    if not country_opened:
-                        raise Exception(f"Could not open country selector. {country_status}")
-
-                    await page.wait_for_timeout(700)
-
-                    # Type India into the picker search field.
-                    search_filled=False
-                    for sel in [
-                        'input[placeholder*="country" i]',
-                        'input[placeholder*="search" i]',
-                        'input[aria-label*="country" i]',
-                        'input[aria-label*="search" i]',
-                        'input[type="text"]'
-                    ]:
-                        try:
-                            boxes=page.locator(sel)
-                            for i in range(await boxes.count()):
-                                box=boxes.nth(i)
-                                if await box.is_visible(timeout=500):
-                                    await box.fill("India")
-                                    search_filled=True
-                                    break
-                            if search_filled:
-                                break
-                        except Exception:
-                            continue
-
-                    if not search_filled:
-                        raise Exception(
-                            f"Country selector opened but its search field could not be found. {country_status}"
-                        )
-
-                    await page.wait_for_timeout(700)
-
-                    # Select India case-insensitively. This also handles the
-                    # lowercase "india" rendered by the Tremendous UI.
-                    india_selected=False
-                    india_matches=page.get_by_text(re.compile(r"^India$", re.I))
-                    for i in range(await india_matches.count()):
-                        loc=india_matches.nth(i)
-                        try:
-                            if await loc.is_visible(timeout=1000):
-                                await loc.click()
-                                india_selected=True
-                                break
-                        except Exception:
-                            continue
-
-                    if not india_selected:
-                        raise Exception(
-                            f"Country search completed but the India option could not be selected. {country_status}"
-                        )
-
-                    await page.wait_for_timeout(500)
-                    stage=f"checking/selecting country (India) | {country_status} | changed to India"
-
+                country_status=await ensure_india(page)
+                stage=f"checking/selecting country (India) | {country_status}"
             except Exception as e:
                 raise Exception(f"Could not select India: {e}")
 
             # --- Select PayPal International ---
             stage="selecting PayPal International"
             try:
-                paypal=page.get_by_text("PayPal International",exact=True).last
+                paypal=page.get_by_text(PAYPAL_RE).last
                 await paypal.wait_for(state="visible",timeout=60000)
                 await paypal.click()
-
-                # Wait for the PayPal transfer form to fully render.
                 await page.wait_for_timeout(1000)
-
             except Exception as e:
-                raise Exception(f"Could not select PayPal International: {e}")
+                raise Exception(f"Could not select PayPal International: {e} | {country_status}")
 
             # --- Wait for BOTH PayPal email fields ---
             stage="waiting for PayPal email fields"
@@ -306,45 +393,26 @@ async def redeem_card(db,uid,card_val,email,link):
                     'input[name*="email" i],'
                     'input[id*="email" i]'
                 )
-
-                await email_fields.first.wait_for(
-                    state="visible",timeout=60000
-                )
-
-                # Do not assume the second field appears immediately.
+                await email_fields.first.wait_for(state="visible",timeout=60000)
                 for _ in range(60):
                     if await email_fields.count() >= 2:
                         break
                     await page.wait_for_timeout(1000)
-
                 if await email_fields.count() < 2:
                     raise Exception("Both PayPal email fields did not load")
-
-                # First field may contain a pre-filled email.
-                # fill() clears the existing value before entering the user's email.
                 await email_fields.nth(0).fill(email)
-
-                # Confirmation email field.
                 await email_fields.nth(1).fill(email)
-
             except Exception as e:
                 raise Exception(f"Could not fill both PayPal email fields: {e}")
 
-            # --- Wait for and click Transfer $3.00 USD ---
+            # --- Click Transfer $X.XX USD ---
             stage=f"finding/clicking Transfer ${card_val:.2f} USD"
             try:
-                transfer_button=page.get_by_role(
-                    "button",name=f"Transfer ${card_val:.2f} USD"
-                )
-                await transfer_button.wait_for(
-                    state="visible",timeout=60000
-                )
+                transfer_button=page.get_by_role("button",name=f"Transfer ${card_val:.2f} USD")
+                await transfer_button.wait_for(state="visible",timeout=60000)
                 await transfer_button.click()
-
             except Exception:
-                # Fallback for slightly different button rendering/text.
                 clicked=False
-
                 for sel in [
                     'button:has-text("Transfer $")',
                     'button:has-text("Transfer")',
@@ -358,11 +426,9 @@ async def redeem_card(db,uid,card_val,email,link):
                         break
                     except Exception:
                         continue
-
                 if not clicked:
                     raise Exception("Transfer button not found")
 
-            # Give the result page/time to settle before checking it.
             try:
                 await page.wait_for_load_state("networkidle",timeout=30000)
             except Exception:
@@ -371,22 +437,9 @@ async def redeem_card(db,uid,card_val,email,link):
             await page.wait_for_timeout(3000)
 
             txt=(await page.content()).lower()
-            success=any(
-                w in txt
-                for w in [
-                    "success",
-                    "confirmed",
-                    "redeemed",
-                    "completed",
-                    "thank you",
-                    "processed"
-                ]
-            )
+            success=any(w in txt for w in ["success","confirmed","redeemed","completed","thank you","processed"])
 
         except Exception as e:
-            # Capture the real exception instead of returning only "Failed".
-            # This is intentionally detailed so the next fix can target the
-            # exact Playwright selector/timeout/page state that failed.
             exc_type=type(e).__name__
             exc_msg=str(e).strip() or repr(e)
 
@@ -396,11 +449,11 @@ async def redeem_card(db,uid,card_val,email,link):
                 if page:
                     current_url=page.url
                     page_title=await page.title()
+                    shot=await page.screenshot(full_page=True,timeout=15000)
             except Exception:
                 pass
 
-            tb=traceback.format_exc()
-            tb_lines=tb.strip().splitlines()
+            tb_lines=traceback.format_exc().strip().splitlines()
             trace_tail=" | ".join(tb_lines[-8:])
 
             err=(
@@ -410,47 +463,27 @@ async def redeem_card(db,uid,card_val,email,link):
                 f"Page title: {page_title}\n"
                 f"Trace: {trace_tail}"
             )
-
-            # Telegram has a message-size limit. Keep the useful beginning
-            # and end of the diagnostic if the traceback is very long.
             if len(err)>3500:
                 err=err[:2200]+"\n... [trace shortened] ...\n"+err[-1200:]
 
-            await conn.execute(
-                "UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",
-                cost,user["user_id"]
-            )
+            await conn.execute("UPDATE users SET total_points=total_points+$1 WHERE user_id=$2",cost,user["user_id"])
 
         finally:
             try:
                 if browser:
                     await browser.destroy()
             except Exception as destroy_error:
-                # Browser cleanup errors should also be visible to us, but
-                # should not hide the original redemption error.
                 if not err:
                     err=f"{type(destroy_error).__name__}: {destroy_error}\nStage: browser cleanup"
-
 
         rid=await conn.fetchval(
             "INSERT INTO redemptions"
             "(user_id,points_spent,paypal_email,status,browser_session_id,error_message,gift_url)"
             "VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING redemption_id",
-            user["user_id"],
-            cost,
-            email,
-            "completed" if success else "failed",
-            browser_sid,
-            err,
-            link
+            user["user_id"],cost,email,"completed" if success else "failed",browser_sid,err,link
         )
 
-        return {
-            "success":success,
-            "rid":rid,
-            "cost":float(cost),
-            "err":err
-        }
+        return {"success":success,"rid":rid,"cost":float(cost),"err":err,"shot":shot}
 
 async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
     uid=update.effective_user.id
@@ -526,6 +559,8 @@ async def msg(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
         if res["success"]: await update.message.reply_text(f"✅ ${val} redeemed!\n💎 Spent: {res['cost']} pts\n📧 {email}\n🔒 Browser wiped.")
         else: await update.message.reply_text(f"❌ Failed: {res['err']}\n💎 Points refunded.")
         await notify_admins(ctx.bot,f"🎁 Redeem #{res['rid']} {'✅ OK' if res['success'] else '❌ FAILED'}\nUser: {update.effective_user.id}\n${val} → {email}\n🔗 {link}\nCost: {res['cost']} pts"+(f"\nError: {res['err']}" if res['err'] else ""))
+        if res.get("shot"):
+            await notify_admins_photo(ctx.bot,res["shot"],f"📸 Redeem #{res['rid']} page at failure")
     except ValueError as e: await update.message.reply_text(f"❌ {e}")
     ctx.user_data["rv"]=ctx.user_data["link"]=None
 
@@ -675,4 +710,3 @@ async def main():
 
 if __name__=="__main__":
     asyncio.run(main())
-    

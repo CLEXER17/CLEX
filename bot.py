@@ -1,4 +1,4 @@
-import os, asyncio, uuid, socket, ipaddress, traceback
+import os, asyncio, uuid, socket, ipaddress, re, traceback
 from urllib.parse import urlparse
 from decimal import Decimal
 from datetime import datetime
@@ -120,114 +120,118 @@ async def redeem_card(db,uid,card_val,email,link):
             # --- Make sure India is selected ---
             stage="checking/selecting country (India)"
             try:
-                paypal_option=page.get_by_text("PayPal International",exact=True).last
                 await page.wait_for_timeout(1500)
 
-                # The Tremendous page can already have India selected.
-                # In that case, DO NOT open the country dropdown at all.
+                # Tremendous can render the selected country as lowercase text
+                # (for example: "india") inside a custom field. Do NOT rely on
+                # exact-case get_by_text("India") and do NOT assume a button.
                 current_country="unknown"
 
-                # The country shown in the Tremendous field is an INPUT VALUE
-                # (for example, "india"), not necessarily visible text.
-                # Check input values first so an already-selected India is
-                # detected without opening the dropdown.
+                # 1) First inspect visible input values. This handles a real
+                # input whose value is "india".
                 try:
                     inputs=page.locator("input")
                     for i in range(await inputs.count()):
                         loc=inputs.nth(i)
                         try:
-                            if not await loc.is_visible(timeout=1000):
+                            if not await loc.is_visible(timeout=500):
                                 continue
                             value=(await loc.input_value()).strip()
                             aria=(await loc.get_attribute("aria-label") or "").strip()
                             placeholder=(await loc.get_attribute("placeholder") or "").strip()
-                            combined=f"{value} {aria} {placeholder}".lower()
-                            if value and any(x in combined for x in [
-                                "india", "united states", "united kingdom",
-                                "canada", "australia", "germany", "france",
-                                "singapore"
-                            ]):
-                                if "india" in value.lower():
-                                    current_country="India"
-                                else:
-                                    current_country=value
+                            combined=f"{value} {aria} {placeholder}".strip()
+                            if not value:
+                                continue
+                            low=value.lower()
+                            if low == "india":
+                                current_country="India"
+                                break
+                            # Identify common country values if the field is
+                            # already populated with another country.
+                            common=[
+                                "united states","united kingdom","canada","australia",
+                                "germany","france","singapore","india","japan",
+                                "south korea","united arab emirates"
+                            ]
+                            if any(c in low for c in common) and not "email" in combined.lower():
+                                current_country=value
                                 break
                         except Exception:
                             continue
                 except Exception:
                     pass
 
-                # Also check visible text / accessible labels as a fallback.
+                # 2) Then inspect visible text case-insensitively. The actual
+                # page uses lowercase "india", so exact-case matching is wrong.
                 if current_country == "unknown":
-                    for country_name in [
-                        "India", "United States", "United Kingdom", "Canada",
-                        "Australia", "Germany", "France", "Singapore"
-                    ]:
-                        try:
-                            matches=page.get_by_text(country_name,exact=True)
-                            visible_count=await matches.count()
-                            for i in range(visible_count):
-                                loc=matches.nth(i)
-                                if await loc.is_visible(timeout=1000):
-                                    current_country=country_name
-                                    break
-                            if current_country != "unknown":
+                    try:
+                        body_text=await page.locator("body").inner_text(timeout=5000)
+                        lines=[x.strip() for x in body_text.splitlines() if x.strip()]
+                        known_countries=[
+                            "India","United States","United Kingdom","Canada",
+                            "Australia","Germany","France","Singapore","Japan",
+                            "South Korea","United Arab Emirates"
+                        ]
+                        for name in known_countries:
+                            if any(line.lower()==name.lower() for line in lines):
+                                current_country=name
                                 break
-                        except Exception:
-                            continue
+                    except Exception:
+                        pass
 
-                # Tell the admin/user what country was already showing.
                 if current_country != "unknown":
                     country_status=f"Country shown before selection: {current_country}"
                 else:
                     country_status="Country shown before selection: could not be detected"
 
+                # If India is already displayed, this is the normal path shown
+                # in the user's screenshot: do nothing and continue.
                 if current_country == "India":
-                    # Screenshot/page state can already be India. Nothing else
-                    # is required; continue directly to PayPal.
-                    pass
+                    stage=f"checking/selecting country (India) | {country_status} | already selected"
                 else:
                     country_opened=False
 
-                    # Click the currently displayed country to open the picker.
+                    # If another country is displayed as text, click it using
+                    # case-insensitive matching.
                     if current_country != "unknown":
                         try:
-                            loc=page.get_by_text(current_country,exact=True).last
+                            loc=page.get_by_text(re.compile(r"^"+re.escape(current_country)+r"$", re.I)).last
                             if await loc.is_visible(timeout=3000):
                                 await loc.click()
                                 country_opened=True
                         except Exception:
                             pass
 
-                    # Fallback: locate a custom country/region selector without
-                    # assuming that "United States" is present.
+                    # Fallback for the custom selector used by Tremendous.
                     if not country_opened:
                         for sel in [
                             '[role="combobox"]',
                             '[aria-haspopup="listbox"]',
                             '[aria-haspopup="true"]',
+                            'button',
                             'select',
                             '[class*="country" i]',
                             '[class*="region" i]'
                         ]:
                             try:
-                                loc=page.locator(sel).last
-                                if await loc.is_visible(timeout=2000):
-                                    await loc.click()
-                                    country_opened=True
+                                locators=page.locator(sel)
+                                for i in range(await locators.count()):
+                                    loc=locators.nth(i)
+                                    if await loc.is_visible(timeout=500):
+                                        await loc.click()
+                                        country_opened=True
+                                        break
+                                if country_opened:
                                     break
                             except Exception:
                                 continue
 
                     if not country_opened:
-                        raise Exception(
-                            f"Could not open country selector. {country_status}"
-                        )
+                        raise Exception(f"Could not open country selector. {country_status}")
 
                     await page.wait_for_timeout(700)
 
-                    # The picker shown in the screenshot has a search field.
-                    # Type India, then click the actual India option.
+                    # Type India into the picker search field.
                     search_filled=False
                     for sel in [
                         'input[placeholder*="country" i]',
@@ -240,7 +244,7 @@ async def redeem_card(db,uid,card_val,email,link):
                             boxes=page.locator(sel)
                             for i in range(await boxes.count()):
                                 box=boxes.nth(i)
-                                if await box.is_visible(timeout=1000):
+                                if await box.is_visible(timeout=500):
                                     await box.fill("India")
                                     search_filled=True
                                     break
@@ -256,14 +260,14 @@ async def redeem_card(db,uid,card_val,email,link):
 
                     await page.wait_for_timeout(700)
 
-                    # Select the exact India result. Do not click the current
-                    # country field again; select the dropdown result instead.
+                    # Select India case-insensitively. This also handles the
+                    # lowercase "india" rendered by the Tremendous UI.
                     india_selected=False
-                    india_matches=page.get_by_text("India",exact=True)
+                    india_matches=page.get_by_text(re.compile(r"^India$", re.I))
                     for i in range(await india_matches.count()):
                         loc=india_matches.nth(i)
                         try:
-                            if await loc.is_visible(timeout=1500):
+                            if await loc.is_visible(timeout=1000):
                                 await loc.click()
                                 india_selected=True
                                 break
@@ -276,9 +280,7 @@ async def redeem_card(db,uid,card_val,email,link):
                         )
 
                     await page.wait_for_timeout(500)
-
-                # Make the detected country status available in logs/errors.
-                stage=f"checking/selecting country (India) | {country_status}"
+                    stage=f"checking/selecting country (India) | {country_status} | changed to India"
 
             except Exception as e:
                 raise Exception(f"Could not select India: {e}")
